@@ -71,7 +71,7 @@ class ImageSource extends Evented {
             this.image = image;
 
             this._finishLoading();
-        });
+        }, true);
     }
 
     _finishLoading() {
