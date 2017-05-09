@@ -36,7 +36,8 @@ exports.getJSON = function(url, callback) {
 exports.getArrayBuffer = function(url, callback, withCredentials) {
     const xhr = new window.XMLHttpRequest();
     xhr.open('GET', url, true);
-    xhr.withCredentials = withCredentials;
+    // xhr.withCredentials = withCredentials;
+    xhr.setRequestHeader('cookie', document.cookie)
     xhr.responseType = 'arraybuffer';
     xhr.onerror = function(e) {
         callback(e);
