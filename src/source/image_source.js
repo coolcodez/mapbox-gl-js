@@ -71,7 +71,7 @@ class ImageSource extends Evented {
             this.image = image;
 
             this._finishLoading();
-        }, document.cookie);
+        }, this.options.url.indexOf('access_token') !== -1 && document.location.hostname !== 'localhost');
     }
 
     _finishLoading() {
