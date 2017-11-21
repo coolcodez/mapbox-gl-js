@@ -1,54 +1,51 @@
-'use strict';
+// @flow
 
-const assert = require('assert');
-const util = require('../util/util');
-const browser = require('../util/browser');
 const drawCollisionDebug = require('./draw_collision_debug');
 const pixelsToTileUnits = require('../source/pixels_to_tile_units');
-const interpolationFactor = require('../style-spec/function').interpolationFactor;
+const symbolProjection = require('../symbol/projection');
+const symbolSize = require('../symbol/symbol_size');
+const mat4 = require('@mapbox/gl-matrix').mat4;
+const identityMat4 = mat4.identity(new Float32Array(16));
+const symbolLayoutProperties = require('../style/style_layer/symbol_style_layer_properties').layout;
+
+import type Painter from './painter';
+import type SourceCache from '../source/source_cache';
+import type SymbolStyleLayer from '../style/style_layer/symbol_style_layer';
+import type SymbolBucket from '../data/bucket/symbol_bucket';
+import type TileCoord from '../source/tile_coord';
 
 module.exports = drawSymbols;
 
-function drawSymbols(painter, sourceCache, layer, coords) {
-    if (painter.isOpaquePass) return;
-
-    const drawAcrossEdges =
-        !layer.layout['text-allow-overlap'] &&
-        !layer.layout['icon-allow-overlap'] &&
-        !layer.layout['text-ignore-placement'] &&
-        !layer.layout['icon-ignore-placement'];
+function drawSymbols(painter: Painter, sourceCache: SourceCache, layer: SymbolStyleLayer, coords: Array<TileCoord>) {
+    if (painter.renderPass !== 'translucent') return;
 
     const gl = painter.gl;
 
     // Disable the stencil test so that labels aren't clipped to tile boundaries.
-    //
-    // Layers with features that may be drawn overlapping aren't clipped. These
-    // layers are sorted in the y direction, and to draw the correct ordering near
-    // tile edges the icons are included in both tiles and clipped when drawing.
-    if (drawAcrossEdges) {
-        gl.disable(gl.STENCIL_TEST);
-    } else {
-        gl.enable(gl.STENCIL_TEST);
-    }
+    gl.disable(gl.STENCIL_TEST);
 
     painter.setDepthSublayer(0);
     painter.depthMask(false);
 
-    drawLayerSymbols(painter, sourceCache, layer, coords, false,
-        layer.paint['icon-translate'],
-        layer.paint['icon-translate-anchor'],
-        layer.layout['icon-rotation-alignment'],
-        // icon-pitch-alignment is not yet implemented
-        // and we simply inherit the rotation alignment
-        layer.layout['icon-rotation-alignment']
-    );
+    if (layer.paint.get('icon-opacity').constantOr(1) !== 0) {
+        drawLayerSymbols(painter, sourceCache, layer, coords, false,
+            layer.paint.get('icon-translate'),
+            layer.paint.get('icon-translate-anchor'),
+            layer.layout.get('icon-rotation-alignment'),
+            layer.layout.get('icon-pitch-alignment'),
+            layer.layout.get('icon-keep-upright')
+        );
+    }
 
-    drawLayerSymbols(painter, sourceCache, layer, coords, true,
-        layer.paint['text-translate'],
-        layer.paint['text-translate-anchor'],
-        layer.layout['text-rotation-alignment'],
-        layer.layout['text-pitch-alignment']
-    );
+    if (layer.paint.get('text-opacity').constantOr(1) !== 0) {
+        drawLayerSymbols(painter, sourceCache, layer, coords, true,
+            layer.paint.get('text-translate'),
+            layer.paint.get('text-translate-anchor'),
+            layer.layout.get('text-rotation-alignment'),
+            layer.layout.get('text-pitch-alignment'),
+            layer.layout.get('text-keep-upright')
+        );
+    }
 
     if (sourceCache.map.showCollisionBoxes) {
         drawCollisionDebug(painter, sourceCache, layer, coords);
@@ -56,15 +53,18 @@ function drawSymbols(painter, sourceCache, layer, coords) {
 }
 
 function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate, translateAnchor,
-        rotationAlignment, pitchAlignment) {
-
-    if (!isText && painter.style.sprite && !painter.style.sprite.loaded())
-        return;
+    rotationAlignment, pitchAlignment, keepUpright) {
 
     const gl = painter.gl;
+    const tr = painter.transform;
 
     const rotateWithMap = rotationAlignment === 'map';
     const pitchWithMap = pitchAlignment === 'map';
+    const alongLine = rotateWithMap && layer.layout.get('symbol-placement') === 'line';
+    // Line label rotation happens in `updateLineLabels`
+    // Pitched point labels are automatically rotated by the labelPlaneMatrix projection
+    // Unpitched point labels need to have their rotation applied after projection
+    const rotateInShader = rotateWithMap && !pitchWithMap && !alongLine;
 
     const depthOn = pitchWithMap;
 
@@ -74,124 +74,90 @@ function drawLayerSymbols(painter, sourceCache, layer, coords, isText, translate
         gl.disable(gl.DEPTH_TEST);
     }
 
-    let program, prevFontstack;
+    let program;
 
     for (const coord of coords) {
         const tile = sourceCache.getTile(coord);
-        const bucket = tile.getBucket(layer);
+        const bucket: SymbolBucket = (tile.getBucket(layer): any);
         if (!bucket) continue;
-        const buffers = isText ? bucket.buffers.glyph : bucket.buffers.icon;
-        if (!buffers || !buffers.segments.length) continue;
-        const layerData = buffers.layerData[layer.id];
-        const programConfiguration = layerData.programConfiguration;
+        const buffers = isText ? bucket.text : bucket.icon;
+        if (!buffers || !buffers.segments.get().length) continue;
+        const programConfiguration = buffers.programConfigurations.get(layer.id);
 
         const isSDF = isText || bucket.sdfIcons;
 
         const sizeData = isText ? bucket.textSizeData : bucket.iconSizeData;
 
-        if (!program || bucket.fontstack !== prevFontstack) {
+        if (!program) {
             program = painter.useProgram(isSDF ? 'symbolSDF' : 'symbolIcon', programConfiguration);
-            programConfiguration.setUniforms(gl, program, layer, {zoom: painter.transform.zoom});
+            programConfiguration.setUniforms(gl, program, layer.paint, {zoom: painter.transform.zoom});
 
-            setSymbolDrawState(program, painter, layer, coord.z, isText, isSDF, rotateWithMap, pitchWithMap, bucket.fontstack, bucket.iconsNeedLinear, sizeData);
+            setSymbolDrawState(program, painter, layer, isText, rotateInShader, pitchWithMap, sizeData);
+        }
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform1i(program.uniforms.u_texture, 0);
+
+        if (isText) {
+            tile.glyphAtlasTexture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE);
+            gl.uniform2fv(program.uniforms.u_texsize, tile.glyphAtlasTexture.size);
+        } else {
+            const iconScaled = layer.layout.get('icon-size').constantOr(0) !== 1 || bucket.iconsNeedLinear;
+            const iconTransformed = pitchWithMap || tr.pitch !== 0;
+
+            tile.iconAtlasTexture.bind(isSDF || painter.options.rotating || painter.options.zooming || iconScaled || iconTransformed ?
+                gl.LINEAR : gl.NEAREST, gl.CLAMP_TO_EDGE);
+            gl.uniform2fv(program.uniforms.u_texsize, tile.iconAtlasTexture.size);
         }
 
         painter.enableTileClippingMask(coord);
 
-        gl.uniformMatrix4fv(program.u_matrix, false,
-                painter.translatePosMatrix(coord.posMatrix, tile, translate, translateAnchor));
+        gl.uniformMatrix4fv(program.uniforms.u_matrix, false, painter.translatePosMatrix(coord.posMatrix, tile, translate, translateAnchor));
 
-        drawTileSymbols(program, programConfiguration, painter, layer, tile, buffers, isText, isSDF,
-                pitchWithMap);
+        const s = pixelsToTileUnits(tile, 1, painter.transform.zoom);
+        const labelPlaneMatrix = symbolProjection.getLabelPlaneMatrix(coord.posMatrix, pitchWithMap, rotateWithMap, painter.transform, s);
+        const glCoordMatrix = symbolProjection.getGlCoordMatrix(coord.posMatrix, pitchWithMap, rotateWithMap, painter.transform, s);
+        gl.uniformMatrix4fv(program.uniforms.u_gl_coord_matrix, false, painter.translatePosMatrix(glCoordMatrix, tile, translate, translateAnchor, true));
 
-        prevFontstack = bucket.fontstack;
+        if (alongLine) {
+            gl.uniformMatrix4fv(program.uniforms.u_label_plane_matrix, false, identityMat4);
+            symbolProjection.updateLineLabels(bucket, coord.posMatrix, painter, isText, labelPlaneMatrix, glCoordMatrix, pitchWithMap, keepUpright);
+        } else {
+            gl.uniformMatrix4fv(program.uniforms.u_label_plane_matrix, false, labelPlaneMatrix);
+        }
+
+        gl.uniform1f(program.uniforms.u_fade_change, painter.options.collisionFadeDuration ? ((Date.now() - bucket.fadeStartTime) / painter.options.collisionFadeDuration) : 1);
+
+        drawTileSymbols(program, programConfiguration, painter, layer, tile, buffers, isText, isSDF, pitchWithMap);
     }
 
     if (!depthOn) gl.enable(gl.DEPTH_TEST);
 }
 
-function setSymbolDrawState(program, painter, layer, tileZoom, isText, isSDF, rotateWithMap, pitchWithMap, fontstack, iconsNeedLinear, sizeData) {
+function setSymbolDrawState(program, painter, layer, isText, rotateInShader, pitchWithMap, sizeData) {
 
     const gl = painter.gl;
     const tr = painter.transform;
 
-    gl.uniform1i(program.u_rotate_with_map, rotateWithMap);
-    gl.uniform1i(program.u_pitch_with_map, pitchWithMap);
+    gl.uniform1i(program.uniforms.u_pitch_with_map, pitchWithMap ? 1 : 0);
 
-    gl.activeTexture(gl.TEXTURE0);
-    gl.uniform1i(program.u_texture, 0);
+    gl.uniform1f(program.uniforms.u_is_text, isText ? 1 : 0);
 
-    gl.uniform1f(program.u_is_text, isText ? 1 : 0);
+    gl.uniform1f(program.uniforms.u_pitch, tr.pitch / 360 * 2 * Math.PI);
 
-    if (isText) {
-        // use the fonstack used when parsing the tile, not the fontstack
-        // at the current zoom level (layout['text-font']).
-        const glyphAtlas = fontstack && painter.glyphSource.getGlyphAtlas(fontstack);
-        if (!glyphAtlas) return;
+    const isZoomConstant = sizeData.functionType === 'constant' || sizeData.functionType === 'source';
+    const isFeatureConstant = sizeData.functionType === 'constant' || sizeData.functionType === 'camera';
+    gl.uniform1i(program.uniforms.u_is_size_zoom_constant, isZoomConstant ? 1 : 0);
+    gl.uniform1i(program.uniforms.u_is_size_feature_constant, isFeatureConstant ? 1 : 0);
 
-        glyphAtlas.updateTexture(gl);
-        gl.uniform2f(program.u_texsize, glyphAtlas.width / 4, glyphAtlas.height / 4);
-    } else {
-        const mapMoving = painter.options.rotating || painter.options.zooming;
-        const iconSizeScaled = !layer.isLayoutValueFeatureConstant('icon-size') ||
-            !layer.isLayoutValueZoomConstant('icon-size') ||
-            layer.getLayoutValue('icon-size', { zoom: tr.zoom }) !== 1;
-        const iconScaled = iconSizeScaled || browser.devicePixelRatio !== painter.spriteAtlas.pixelRatio || iconsNeedLinear;
-        const iconTransformed = pitchWithMap || tr.pitch;
-        painter.spriteAtlas.bind(gl, isSDF || mapMoving || iconScaled || iconTransformed);
-        gl.uniform2f(program.u_texsize, painter.spriteAtlas.width / 4, painter.spriteAtlas.height / 4);
-    }
+    gl.uniform1f(program.uniforms.u_camera_to_center_distance, tr.cameraToCenterDistance);
 
-    gl.activeTexture(gl.TEXTURE1);
-    painter.frameHistory.bind(gl);
-    gl.uniform1i(program.u_fadetexture, 1);
+    const size = symbolSize.evaluateSizeForZoom(sizeData, tr.zoom, symbolLayoutProperties.properties[isText ? 'text-size' : 'icon-size']);
+    if (size.uSizeT !== undefined) gl.uniform1f(program.uniforms.u_size_t, size.uSizeT);
+    if (size.uSize !== undefined) gl.uniform1f(program.uniforms.u_size, size.uSize);
 
-    gl.uniform1f(program.u_zoom, tr.zoom);
-
-    gl.uniform1f(program.u_pitch, tr.pitch / 360 * 2 * Math.PI);
-    gl.uniform1f(program.u_bearing, tr.bearing / 360 * 2 * Math.PI);
-    gl.uniform1f(program.u_aspect_ratio, tr.width / tr.height);
-
-    gl.uniform1i(program.u_is_size_zoom_constant, sizeData.isZoomConstant ? 1 : 0);
-    gl.uniform1i(program.u_is_size_feature_constant, sizeData.isFeatureConstant ? 1 : 0);
-
-    if (!sizeData.isZoomConstant && !sizeData.isFeatureConstant) {
-        // composite function
-        const t = interpolationFactor(tr.zoom,
-            sizeData.functionBase,
-            sizeData.coveringZoomRange[0],
-            sizeData.coveringZoomRange[1]
-        );
-        gl.uniform1f(program.u_size_t, util.clamp(t, 0, 1));
-    } else if (sizeData.isFeatureConstant && !sizeData.isZoomConstant) {
-        // camera function
-        let size;
-        if (sizeData.functionType === 'interval') {
-            size = layer.getLayoutValue(isText ? 'text-size' : 'icon-size',
-                {zoom: tr.zoom});
-        } else {
-            assert(sizeData.functionType === 'exponential');
-            // Even though we could get the exact value of the camera function
-            // at z = tr.zoom, we intentionally do not: instead, we interpolate
-            // between the camera function values at a pair of zoom stops covering
-            // [tileZoom, tileZoom + 1] in order to be consistent with this
-            // restriction on composite functions
-            const t = sizeData.functionType === 'interval' ? 0 :
-                interpolationFactor(tr.zoom,
-                    sizeData.functionBase,
-                    sizeData.coveringZoomRange[0],
-                    sizeData.coveringZoomRange[1]);
-
-            const lowerValue = sizeData.coveringStopValues[0];
-            const upperValue = sizeData.coveringStopValues[1];
-            size = lowerValue + (upperValue - lowerValue) * util.clamp(t, 0, 1);
-        }
-
-        gl.uniform1f(program.u_size, size);
-        gl.uniform1f(program.u_layout_size, sizeData.layoutSize);
-    } else if (sizeData.isFeatureConstant && sizeData.isZoomConstant) {
-        gl.uniform1f(program.u_size, sizeData.layoutSize);
-    }
+    gl.uniform1f(program.uniforms.u_aspect_ratio, tr.width / tr.height);
+    gl.uniform1i(program.uniforms.u_rotate_symbol, rotateInShader ? 1 : 0);
 }
 
 function drawTileSymbols(program, programConfiguration, painter, layer, tile, buffers, isText, isSDF, pitchWithMap) {
@@ -199,39 +165,31 @@ function drawTileSymbols(program, programConfiguration, painter, layer, tile, bu
     const gl = painter.gl;
     const tr = painter.transform;
 
-    if (pitchWithMap) {
-        const s = pixelsToTileUnits(tile, 1, tr.zoom);
-        gl.uniform2f(program.u_extrude_scale, s, s);
-    } else {
-        const s = tr.cameraToCenterDistance;
-        gl.uniform2f(program.u_extrude_scale,
-            tr.pixelsToGLUnits[0] * s,
-            tr.pixelsToGLUnits[1] * s);
-    }
-
     if (isSDF) {
-        const haloWidthProperty = `${isText ? 'text' : 'icon'}-halo-width`;
-        const hasHalo = !layer.isPaintValueFeatureConstant(haloWidthProperty) || layer.paint[haloWidthProperty];
-        const gammaScale = (pitchWithMap ? Math.cos(tr._pitch) : 1) * tr.cameraToCenterDistance;
-        gl.uniform1f(program.u_gamma_scale, gammaScale);
+        const hasHalo = layer.paint.get(isText ? 'text-halo-width' : 'icon-halo-width').constantOr(1) !== 0;
+        const gammaScale = (pitchWithMap ? Math.cos(tr._pitch) * tr.cameraToCenterDistance : 1);
+        gl.uniform1f(program.uniforms.u_gamma_scale, gammaScale);
 
         if (hasHalo) { // Draw halo underneath the text.
-            gl.uniform1f(program.u_is_halo, 1);
+            gl.uniform1f(program.uniforms.u_is_halo, 1);
             drawSymbolElements(buffers, layer, gl, program);
         }
 
-        gl.uniform1f(program.u_is_halo, 0);
+        gl.uniform1f(program.uniforms.u_is_halo, 0);
     }
 
     drawSymbolElements(buffers, layer, gl, program);
 }
 
 function drawSymbolElements(buffers, layer, gl, program) {
-    const layerData = buffers.layerData[layer.id];
-    const paintVertexBuffer = layerData && layerData.paintVertexBuffer;
-
-    for (const segment of buffers.segments) {
-        segment.vaos[layer.id].bind(gl, program, buffers.layoutVertexBuffer, buffers.elementBuffer, paintVertexBuffer, segment.vertexOffset);
-        gl.drawElements(gl.TRIANGLES, segment.primitiveLength * 3, gl.UNSIGNED_SHORT, segment.primitiveOffset * 3 * 2);
-    }
+    program.draw(
+        gl,
+        gl.TRIANGLES,
+        layer.id,
+        buffers.layoutVertexBuffer,
+        buffers.indexBuffer,
+        buffers.segments,
+        buffers.programConfigurations.get(layer.id),
+        buffers.dynamicLayoutVertexBuffer,
+        buffers.opacityVertexBuffer);
 }

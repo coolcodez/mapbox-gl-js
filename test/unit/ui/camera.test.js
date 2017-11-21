@@ -784,6 +784,20 @@ test('camera', (t) => {
             t.end();
         });
 
+        t.test('does not throw when cameras current zoom is sufficiently greater than passed zoom option', (t)=>{
+            const camera = createCamera({zoom: 22, center:[0, 0]});
+            t.doesNotThrow(()=>camera.flyTo({zoom:10, center:[0, 0]}));
+            t.end();
+        });
+
+        t.test('does not throw when cameras current zoom is above maxzoom and an offset creates infinite zoom out factor', (t)=>{
+            const transform = new Transform(0, 20.9999, true);
+            transform.resize(512, 512);
+            const camera = new Camera(transform, {}).jumpTo({zoom: 21, center:[0, 0]});
+            t.doesNotThrow(()=>camera.flyTo({zoom:7.5, center:[0, 0], offset:[0, 70]}));
+            t.end();
+        });
+
         t.test('zooms to specified level', (t) => {
             const camera = createCamera();
             camera.flyTo({ zoom: 3.2, animate: false });
@@ -1147,6 +1161,62 @@ test('camera', (t) => {
             camera.flyTo(options);
         });
 
+        t.test('respects transform\'s maxZoom', (t) => {
+
+            const transform = new Transform(2, 10, false);
+            transform.resize(512, 512);
+
+            const camera = new Camera(transform, {});
+
+            camera.on('moveend', () => {
+                t.equalWithPrecision(camera.getZoom(), 10, 1e-10);
+                const { lng, lat } = camera.getCenter();
+                t.equalWithPrecision(lng, 12, 1e-10);
+                t.equalWithPrecision(lat, 34, 1e-10);
+
+                t.end();
+            });
+
+            const flyOptions = { center: [12, 34], zoom: 30};
+            camera.flyTo(flyOptions);
+        });
+
+        t.test('respects transform\'s minZoom', (t) => {
+
+            const transform = new Transform(2, 10, false);
+            transform.resize(512, 512);
+
+            const camera = new Camera(transform, {});
+
+            camera.on('moveend', () => {
+                t.equalWithPrecision(camera.getZoom(), 2, 1e-10);
+                const { lng, lat } = camera.getCenter();
+                t.equalWithPrecision(lng, 12, 1e-10);
+                t.equalWithPrecision(lat, 34, 1e-10);
+
+                t.end();
+            });
+
+            const flyOptions = { center: [12, 34], zoom: 1};
+            camera.flyTo(flyOptions);
+        });
+
+        t.test('resets duration to 0 if it exceeds maxDuration', (t) => {
+            let startTime, endTime, timeDiff;
+            const camera = createCamera({ center: [37.63454, 55.75868], zoom: 18});
+
+            camera
+                .on('movestart', () => { startTime = new Date(); })
+                .on('moveend', () => {
+                    endTime = new Date();
+                    timeDiff = endTime - startTime;
+                    t.equalWithPrecision(timeDiff, 0, 1e+1);
+                    t.end();
+                });
+
+            camera.flyTo({ center: [-122.3998631, 37.7884307], maxDuration: 100 });
+        });
+
         t.end();
     });
 
@@ -1308,7 +1378,7 @@ test('camera', (t) => {
             const bb = [[-133, 16], [-68, 50]];
 
             camera.fitBounds(bb, { padding: {top: 10, right: 75, bottom: 50, left: 25}, duration:0 });
-            t.deepEqual(fixedLngLat(camera.getCenter(), 4), { lng: -91.5221, lat: 28.6089 }, 'pans to coordinates based on fitBounds with padding option as object applied');
+            t.deepEqual(fixedLngLat(camera.getCenter(), 4), { lng: -96.5558, lat: 32.0833 }, 'pans to coordinates based on fitBounds with padding option as object applied');
             t.end();
         });
 

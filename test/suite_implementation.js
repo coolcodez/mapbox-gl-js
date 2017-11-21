@@ -1,7 +1,6 @@
 'use strict';
 
 const ajax =  require('../src/util/ajax');
-const sinon = require('sinon');
 const request = require('request');
 const PNG = require('pngjs').PNG;
 const Map = require('../src/ui/map');
@@ -36,22 +35,33 @@ module.exports = function(style, options, _callback) {
         classes: options.classes,
         interactive: false,
         attributionControl: false,
-        preserveDrawingBuffer: true
+        preserveDrawingBuffer: true,
+        axonometric: options.axonometric || false,
+        skew: options.skew || [0, 0],
+        collisionFadeDuration: 0
     });
 
     // Configure the map to never stop the render loop
     map.repaint = true;
 
     if (options.debug) map.showTileBoundaries = true;
-    if (options.collisionDebug) map.showCollisionBoxes = true;
     if (options.showOverdrawInspector) map.showOverdrawInspector = true;
 
     const gl = map.painter.gl;
 
     map.once('load', () => {
+        if (options.collisionDebug) {
+            map.showCollisionBoxes = true;
+            if (options.operations) {
+                options.operations.push(["wait"]);
+            } else {
+                options.operations = [["wait"]];
+            }
+        }
         applyOperations(map, options.operations, () => {
-            const w = options.width * window.devicePixelRatio;
-            const h = options.height * window.devicePixelRatio;
+            const viewport = gl.getParameter(gl.VIEWPORT);
+            const w = viewport[2];
+            const h = viewport[3];
 
             const pixels = new Uint8Array(w * h * 4);
             gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
@@ -102,10 +112,15 @@ function applyOperations(map, operations, callback) {
         };
         wait();
 
+    } else if (operation[0] === 'sleep') {
+        // Prefer "wait", which renders until the map is loaded
+        // Use "sleep" when you need to test something that sidesteps the "loaded" logic
+        setTimeout(() => {
+            applyOperations(map, operations.slice(1), callback);
+        }, operation[1]);
     } else if (operation[0] === 'addImage') {
-        const img = PNG.sync.read(fs.readFileSync(path.join(__dirname, './integration', operation[2])));
-        const pixelRatio = operation.length > 3 ? operation[3] : 1;
-        map.addImage(operation[1], img.data, {height: img.height, width: img.width, pixelRatio: pixelRatio});
+        const {data, width, height} = PNG.sync.read(fs.readFileSync(path.join(__dirname, './integration', operation[2])));
+        map.addImage(operation[1], {width, height, data: new Uint8Array(data)}, operation[3] || {});
         applyOperations(map, operations.slice(1), callback);
 
     } else {
@@ -122,7 +137,7 @@ function cached(data, callback) {
     });
 }
 
-sinon.stub(ajax, 'getJSON').callsFake((url, callback) => {
+ajax.getJSON = function({ url }, callback) {
     if (cache[url]) return cached(cache[url], callback);
     return request(url, (error, response, body) => {
         if (!error && response.statusCode >= 200 && response.statusCode < 300) {
@@ -138,11 +153,11 @@ sinon.stub(ajax, 'getJSON').callsFake((url, callback) => {
             callback(error || new Error(response.statusCode));
         }
     });
-});
+};
 
-sinon.stub(ajax, 'getArrayBuffer').callsFake((url, callback) => {
+ajax.getArrayBuffer = function({ url }, callback) {
     if (cache[url]) return cached(cache[url], callback);
-    return request({url: url, encoding: null}, (error, response, body) => {
+    return request({ url, encoding: null }, (error, response, body) => {
         if (!error && response.statusCode >= 200 && response.statusCode < 300) {
             cache[url] = {data: body};
             callback(null, {data: body});
@@ -150,11 +165,11 @@ sinon.stub(ajax, 'getArrayBuffer').callsFake((url, callback) => {
             callback(error || new Error(response.statusCode));
         }
     });
-});
+};
 
-sinon.stub(ajax, 'getImage').callsFake((url, callback) => {
+ajax.getImage = function({ url }, callback) {
     if (cache[url]) return cached(cache[url], callback);
-    return request({url: url, encoding: null}, (error, response, body) => {
+    return request({ url, encoding: null }, (error, response, body) => {
         if (!error && response.statusCode >= 200 && response.statusCode < 300) {
             new PNG().parse(body, (err, png) => {
                 if (err) return callback(err);
@@ -162,19 +177,19 @@ sinon.stub(ajax, 'getImage').callsFake((url, callback) => {
                 callback(null, png);
             });
         } else {
-            callback(error || new Error(response.statusCode));
+            callback(error || {status: response.statusCode});
         }
     });
-});
+};
 
-sinon.stub(browser, 'getImageData').callsFake((img) => {
-    return new Uint8Array(img.data);
-});
+browser.getImageData = function({width, height, data}) {
+    return {width, height, data: new Uint8Array(data)};
+};
 
 // Hack: since node doesn't have any good video codec modules, just grab a png with
 // the first frame and fake the video API.
-sinon.stub(ajax, 'getVideo').callsFake((urls, callback) => {
-    return request({url: urls[0], encoding: null}, (error, response, body) => {
+ajax.getVideo = function(urls, callback) {
+    return request({ url: urls[0], encoding: null }, (error, response, body) => {
         if (!error && response.statusCode >= 200 && response.statusCode < 300) {
             new PNG().parse(body, (err, png) => {
                 if (err) return callback(err);
@@ -191,4 +206,4 @@ sinon.stub(ajax, 'getVideo').callsFake((urls, callback) => {
             callback(error || new Error(response.statusCode));
         }
     });
-});
+};
