@@ -1,4 +1,3 @@
-'use strict';
 
 const ValidationError = require('../error/validation_error');
 const unbundle = require('../util/unbundle_jsonlint');
@@ -24,7 +23,7 @@ module.exports = function validateSource(options) {
         errors = errors.concat(validateObject({
             key: key,
             value: value,
-            valueSpec: styleSpec.source_tile,
+            valueSpec: styleSpec[`source_${type}`],
             style: options.style,
             styleSpec: styleSpec
         }));
