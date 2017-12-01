@@ -139,8 +139,9 @@ exports.getImage = function(
 ) {
     // request the image with XHR to work around caching issues
     // see https://github.com/mapbox/mapbox-gl-js/issues/1470
-    return (
-        exports.getArrayBuffer(requestParameters, (err, imgData) => {
+    return exports.getArrayBuffer(
+        requestParameters,
+        (err, imgData) => {
             if (err) {
                 callback(err)
             } else if (imgData) {
@@ -160,7 +161,7 @@ exports.getImage = function(
                     ? URL.createObjectURL(blob)
                     : transparentPngUrl
             }
-        }),
+        },
         withCredentials
     )
 }
